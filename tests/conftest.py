@@ -1,33 +1,22 @@
 import os
 import pytest
 
-from mordecai3.geonames import DataExtent, GeonamesService
-from mordecai3.elasticsearch import (
-    setup_es_client,
-    check_es_and_geonames,
-    es_is_accepting_connection,
-    es_has_geonames_index,
-)
+from mordecai3.geonames import DataExtent, GeonamesService, setup_pg_pool
 from mordecai3.logging import setup_logging
 
-ES_HOST = os.getenv("ES_HOST", "localhost")
-ES_PORT = int(os.getenv("ES_PORT", 9200))
+PG_DSN = os.getenv("PG_DSN", "host=localhost dbname=geoindex user=postgres")
 
 setup_logging()
 
 
 @pytest.fixture(scope="session")
-def es_client():
-    return setup_es_client(hosts=[ES_HOST], port=ES_PORT)
+def pg_pool():
+    return setup_pg_pool(PG_DSN)
 
 
 @pytest.fixture(scope="session")
-def geonames_service(es_client):
-    if not es_is_accepting_connection(es_client):
-        pytest.skip("Elasticsearch not available")
-    if not es_has_geonames_index(es_client):
-        pytest.skip("Geonames index not found")
-    return GeonamesService(es_client=es_client)
+def geonames_service(pg_pool):
+    return GeonamesService(pg_pool)
 
 
 @pytest.fixture(scope="session")
@@ -54,16 +43,3 @@ def geoparser_all_data(geonames_service_all_data):
 def geoparser_test_data(geonames_service_test_data):
     from mordecai3.geoparse import Geoparser
     return Geoparser(geonames=geonames_service_test_data)
-
-
-@pytest.fixture(scope="session", autouse=True)
-def log_data_extent(es_client):
-    extent, msg = check_es_and_geonames(es_client)
-    if extent == DataExtent.NA:
-        print(f"\n⚠️  WARNING: {msg} - skipping ES-dependent tests\n")
-    elif extent == DataExtent.NONE:
-        print(f"\n⚠️  WARNING: {msg} - skipping ES-dependent tests\n")
-    elif extent == DataExtent.TEST:
-        print(f"\nℹ️  {msg}\n")
-    else:
-        print(f"\n✅ {msg}\n")
