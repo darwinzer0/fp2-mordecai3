@@ -9,7 +9,6 @@ def setup_logging(level: int=logging.INFO, format_string: str | None=None,
     if quiet_third_party:
         # Reduce noise from verbose 3rd party packages
         logging.getLogger("urllib3").setLevel(logging.WARNING)
-        logging.getLogger("elasticsearch").setLevel(logging.ERROR)
     
     logging.basicConfig(
         level=level,

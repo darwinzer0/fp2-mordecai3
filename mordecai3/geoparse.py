@@ -1,4 +1,3 @@
-
 from collections import Counter
 import logging
 import numpy as np
@@ -8,14 +7,8 @@ import torch
 import re
 import warnings
 
-from elasticsearch import Elasticsearch
-try: 
-    from elasticsearch.dsl import Search             # type: ignore
-except ImportError:
-    # elasticsearch < 8.18.0
-    from elasticsearch_dsl import Search
 from importlib import resources
-try: 
+try:
     from importlib.resources.abc import Traversable  # type: ignore[import-untyped]
 except ImportError:
     # Python < 3.13
@@ -25,8 +18,7 @@ import jellyfish
 import numpy as np
 import numpy.typing as npt
 
-from .elasticsearch import setup_es_client
-from .geonames import GeonamesService
+from .geonames import GeonamesService, setup_pg_pool
 from .mordecai_utilities import spacy_doc_setup
 from .torch_model import ProductionData, geoparse_model
 
@@ -50,7 +42,6 @@ def load_model(model_path, device=None):
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     return model
-
 
 
 def guess_in_rel(ent):
@@ -107,7 +98,7 @@ def doc_to_ex_expanded(doc):
     of dictionaries with information on each place name entity.
 
     In the broader pipeline, this is called after nlp() and the results are passed to the 
-    Elasticsearch step.
+    Geonames lookup step.
 
     Parameters
     ---------
@@ -129,7 +120,6 @@ def doc_to_ex_expanded(doc):
             tensor = np.mean(np.vstack([i._.tensor for i in ent]), axis=0)
             other_locs = [i for e in loc_ents for i in e if i not in ent]
             in_rel = guess_in_rel(ent)
-            #print("detected relation: ", ent.text, "-->", in_rel)
             if other_locs:
                 locs_tensor = np.mean(np.vstack([i._.tensor for i in other_locs if i not in ent]), axis=0)
             else:
@@ -145,41 +135,43 @@ def doc_to_ex_expanded(doc):
             data.append(d)
     return data
 
-def load_hierarchy(asset_path):
-    fn = os.path.join(asset_path, "hierarchy.txt")
-    with open(fn, "r", encoding="utf-8") as f:
-        hierarchy = f.read()
-    hierarchy = hierarchy.split("\n")
-    hier_dict = {}
-    for h in hierarchy:
-        h_split = h.split("\t")
-        try:
-            hier_dict.update({h_split[1]: h_split[0]})
-        except IndexError:
-            continue
-    return hier_dict
-            
 
 class Geoparser:
-    conn: Search
 
     def __init__(self, 
-                 model_path: str | Traversable | None=None, 
-                 geo_asset_path: str | Traversable | None=None,
-                 geonames: GeonamesService | None=None,
+                 model_path: str | Traversable | None = None,
+                 geonames: GeonamesService | None = None,
+                 pg_dsn: str | None = None,
                  nlp=None,
-                 debug: bool=False,
+                 debug: bool = False,
                  trim=None,
-                 check_es: bool=True,
-                 hosts: list[str] | None = None,
-                 port: int = 9200,
-                 device='cpu',
-                 use_ssl: bool=False,
-                 es_client: Elasticsearch | None=None):
+                 device='cpu'):
+        """
+        Parameters
+        ----------
+        model_path : str or Traversable or None
+            Path to the .pt model weights file. Defaults to the bundled asset.
+        geonames : GeonamesService or None
+            A pre-constructed GeonamesService instance. If None, one is built
+            from pg_dsn.
+        pg_dsn : str or None
+            libpq connection string, e.g.
+            "host=localhost dbname=geoindex user=postgres password=secret"
+            Required if geonames is not provided.
+        nlp : spaCy Language or None
+            Pre-loaded spaCy pipeline. Loaded fresh if None.
+        debug : bool
+            If True, returns top 4 results per entity rather than the best.
+        trim : bool or None
+            If True, strips internal ranking keys from output dicts.
+        device : str
+            'cpu' or 'cuda'.
+        """
         if device != "cpu":
             device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.debug = debug
         self.trim = trim
+
         if not nlp:
             self.nlp = load_nlp()
         else:
@@ -187,78 +179,52 @@ class Geoparser:
                 try:
                     nlp.add_pipe("token_tensors")
                 except Exception as e:
-                    # TODO: this is currently catching the error that the pipe already exists,
-                    # but it shouldn't catch the error that it doesn't know what
-                    # token_tensors is.
                     logger.info(f"Error loading token_tensors pipe: {e}")
-                    pass
             self.nlp = nlp
-        
-        # Handle ES and GeonamesService connection
 
-        if es_client is not None:
-            self.conn = Search(using=es_client, index="geonames")
-        else:
-            es_client = setup_es_client(hosts=hosts, port=port, use_ssl=use_ssl)
-            self.conn = Search(using=es_client, index="geonames")
-        
+        # GeonamesService — accepts a pre-built instance or builds one from DSN
         if geonames is not None:
             self.geonames = geonames
+        elif pg_dsn is not None:
+            pg_pool = setup_pg_pool(pg_dsn)
+            self.geonames = GeonamesService(pg_pool)
         else:
-            self.geonames = GeonamesService(es_client=es_client)
+            raise ValueError(
+                "Either 'geonames' (a GeonamesService instance) or "
+                "'pg_dsn' (a libpq connection string) must be provided."
+            )
 
-        if check_es:
-            logger.info("Checking Elasticsearch connection...")
-            try:
-                assert len(list(self.conn[1])) > 0
-                logger.info("Successfully connected to Elasticsearch.")
-            except:
-                logger.warning("Could not connect to Elasticsearch, but the logic of this code path may be wrong...")
-                ConnectionError("Could not locate Elasticsearch. Are you sure it's running?")
-        
-        
         if not model_path:
-            model_path =  resources.files("mordecai3") / "assets/mordecai_2025-08-27.pt"
+            model_path = resources.files("mordecai3") / "assets/mordecai_2025-08-27.pt"
         self.model = load_model(model_path, device=device)
-        if not geo_asset_path:
-            geo_asset_path = resources.files("mordecai3") / "assets/"
-        self.hierarchy = load_hierarchy(geo_asset_path)
         self.model.to(device)
 
     def lookup_city(self, entry):
         """
-        
+        Resolve a place entry to its parent city using the geonames_hierarchy
+        table (via GeonamesService.get_entry_by_id), replacing the old
+        file-based hierarchy.txt dict lookup.
         """
         city_id = ""
         city_name = ""
         if entry['feature_code'] == 'PPLX':
-            try:
-                parent_id = self.hierarchy[entry['geonameid']]
-                parent_res = self.geonames.get_entry_by_id(parent_id)
-                if parent_res['feature_class'] == "P":
-                    city_id = parent_id
-                    city_name = parent_res['name']
-            except KeyError:
-                city_id = entry['name']
-                city_name = entry['geonameid']
+            parent_res = self.geonames.get_entry_by_id(entry['geonameid'])
+            if parent_res and parent_res['feature_class'] == "P":
+                city_id = parent_res['geonameid']
+                city_name = parent_res['name']
+            else:
+                city_id = entry['geonameid']
+                city_name = entry['name']
         elif entry['feature_class'] == 'S':
-            try:
-                parent_id = self.hierarchy[entry['geonameid']]
-                parent_res = self.geonames.get_entry_by_id(parent_id)
-                if parent_res['feature_class'] == "P":
-                    city_id = parent_id
-                    city_name = parent_res['name']
-            except KeyError:
-                city_id = ""
-                city_name = ""
+            parent_res = self.geonames.get_entry_by_id(entry['geonameid'])
+            if parent_res and parent_res['feature_class'] == "P":
+                city_id = parent_res['geonameid']
+                city_name = parent_res['name']
         elif re.search("PPL", entry['feature_code']):
-            # all other cities, just return self
+            # all other populated places: return self
             city_name = entry['name']
             city_id = entry['geonameid']
-        else:
-            # if it's something else, there is no city
-            city_id = ""
-            city_name = ""
+        # anything else: city_id and city_name remain ""
         return city_id, city_name
 
 
@@ -276,29 +242,23 @@ class Geoparser:
         text : str or spacy Doc (with ._.tensor attributes)
             The text to geoparse.
         debug : bool
-            If True, returns the top 4 results for each geoparsed location, rather than the single best.
-            This is useful for debugging or collecting new annotations.
+            If True, returns the top 4 results for each geoparsed location,
+            rather than the single best. Useful for debugging or annotation.
         trim : bool
-            If True (default: True), removes some of the keys from the output dictionary that are only used
-            internally for selecting the best geoparsed location. Including these keys is
-            useful for debugging.
+            If True (default), removes internal ranking keys from output dicts.
         known_country : str
-            If provided, the geoparser will only consider locations in the given country.
+            If provided, restricts candidates to this ISO3 country code.
+        max_choices : int
+            Maximum candidate entries per toponym passed to the ranker.
 
         Returns
         -------
         output : dict
-            Includes the following keys:
-            - "doc_text": a string of the input text
-            - "event_location_raw": str, the place name of the 'event location' (if provided)
-            - "geolocated_ents": list of dicts, each dict is a geoparsed location
-
-        Example
-        -------
-        >>> text = "The earthquake struck in the city of Christchurch, New Zealand."
-        >>> geoparser.geoparse_doc(text)
+            - "doc_text": input text as string
+            - "event_location_raw": EVENT_LOC entity text if present
+            - "geolocated_ents": list of geoparsed location dicts
         """
-        if type(text) is str:   
+        if type(text) is str:
             doc = self.nlp(text)
         elif type(text) is spacy.tokens.doc.Doc:
             doc = text
@@ -308,20 +268,17 @@ class Geoparser:
         doc_ex = doc_to_ex_expanded(doc)
         if doc_ex:
             es_data = add_es_data_doc(doc_ex, self.geonames, max_results=max_choices,
-                                              known_country=known_country)
+                                      known_country=known_country)
 
             dataset = ProductionData(es_data, max_choices=max_choices)
-
             data_loader = DataLoader(dataset=dataset, batch_size=64, shuffle=False)
             with torch.no_grad():
                 self.model.eval()
                 pred_val_list = []
                 for input_batch in data_loader:
-                    # Move the entire input batch to the model's device
                     input_batch_on_device = {k: v.to(self.model.device) for k, v in input_batch.items()}
                     pred_val_list.append(self.model(input_batch_on_device))
                 pred_val = torch.cat(pred_val_list, dim=0)
-
 
         event_doc = doc
 
@@ -334,11 +291,8 @@ class Geoparser:
         elif len(es_data) == 0:
             return output
         else:
-            # Iterate over all the entities in the document
             for (ent, pred) in zip(es_data, pred_val):
                 logger.debug("**Place name**: {}".format(ent['search_name']))
-                # if the last one is the argmax, then the model thinks that no answer is correct
-                # so return blank
                 if pred[-1] == pred.max():
                     logger.debug("Model predicts no answer")
                     best = {"search_name": ent['search_name'],
@@ -349,26 +303,9 @@ class Geoparser:
 
                 for n, score in enumerate(pred):
                     if n < len(ent['es_choices']):
-                        ent['es_choices'][n]['score'] = score.item() # torch tensor --> float
+                        ent['es_choices'][n]['score'] = score.item()
                 results = [e for e in ent['es_choices'] if 'score' in e.keys()]
 
-                # this is what the elements of "results" look like
-                 #  {'feature_code': 'PPL',
-                 #  'feature_class': 'P',
-                 #  'country_code3': 'BRA',
-                 #  'lat': -22.99835,
-                 #  'lon': -43.36545,
-                 #  'name': 'Barra da Tijuca',
-                 #  'admin1_code': '21',
-                 #  'admin1_name': 'Rio de Janeiro',
-                 #  'admin2_code': '3304557',
-                 #  'admin2_name': 'Rio de Janeiro',
-                 #  'geonameid': '7290718',
-                 #  'score': 1.0,
-                 #  'search_name': 'Barra da Tijuca',
-                 #  'start_char': 557,
-                 #  'end_char': 581
-                 #  }
                 if not results:
                     logger.debug("(no results)")
                 best = {"search_name": ent['search_name'],
@@ -379,8 +316,7 @@ class Geoparser:
                     logger.debug("No scores found.")
                     continue
                 if np.argmax(scores) == len(scores) - 1:
-                    logger.debug("Picking final ''null'' result.")
-                    # print the next best result:
+                    logger.debug("Picking final 'null' result.")
                     if len(scores) == 1:
                         logger.debug(f"Only one score found: {results[0]}")
                     if len(scores) > 1:
@@ -395,7 +331,6 @@ class Geoparser:
                     best["search_name"] = ent['search_name']
                     best["start_char"] = ent['start_char']
                     best["end_char"] = ent['end_char']
-                    ## Add in city info here
                     best['city_id'], best['city_name'] = self.lookup_city(best)
                     best_list.append(best)
                 if results and debug:
@@ -415,75 +350,58 @@ class Geoparser:
                 i = [i.pop(key) for key in trim_keys if key in i.keys()]
             output = {"doc_text": doc.text,
                  "event_location_raw": ''.join([i.text_with_ws for i in event_doc.ents if i.label_ == "EVENT_LOC"]).strip(),
-                 "geolocated_ents": best_list} 
+                 "geolocated_ents": best_list}
         else:
             output = {"doc_text": doc.text,
                  "event_location_raw": ''.join([i.text_with_ws for i in event_doc.ents if i.label_ == "EVENT_LOC"]).strip(),
                  "geolocated_ents": best_list}
         return output
 
-            
 
-def add_es_data(ex, 
-                geonames_service: GeonamesService, 
-                max_results=50, 
-                fuzzy=0, 
+def add_es_data(ex,
+                geonames_service: GeonamesService,
+                max_results=50,
+                fuzzy=0,
                 limit_types=False,
-                remove_correct=False, 
+                remove_correct=False,
                 known_country=None):
     """
-    Run an Elasticsearch/geonames query for a single example and add the results
+    Run a Geonames/Postgres query for a single example and add the results
     to the object.
 
     Parameters
     ---------
-    ex: dict
-      output of doc_to_ex_expanded
-    conn: elasticsearch connection
-    max_results: int
-      Maximum results to bring back from ES
-    fuzzy: int
-      Allow fuzzy results? 0=exact matches. Higher numbers will
-      increase the fuzziness of the search. 
-    remove_correct: bool
-        If True, remove the correct result from the list of results.
-        This is useful for training a model to handle "none of the above"
-        cases.
-
-    Examples
-    --------
-    ex = {"search_name": ent.text,
-         "tensor": tensor,
-         "doc_tensor": doc_tensor,
-         "locs_tensor": locs_tensor,
-         "sent": ent.sent.text,
-         "in_rel": in_rel,    # this comes from the heuristic `guess_in_rel` fuction defined in geoparse.py
-         "start_char": ent[0].idx,
-         "end_char": ent[-1].idx + len(ent.text)}
-    d_es = add_es_data(d)
-    # d_es now has a "es_choices" key and a "correct" key that indicates which geonames 
-    # entry was the correct one.
+    ex : dict
+        Output of doc_to_ex_expanded.
+    geonames_service : GeonamesService
+        Postgres-backed GeonamesService instance.
+    max_results : int
+        Maximum candidates to retrieve.
+    fuzzy : int
+        0 = exact match. Higher values broaden the search via pg_trgm.
+    remove_correct : bool
+        If True, removes the correct result (used during training data prep).
+    known_country : str or None
+        ISO3 country code to restrict candidates.
     """
     max_results = int(max_results)
     fuzzy = int(fuzzy)
     search_name = ex['search_name']
-    # if we detect a parent location using our heuristic (see `guess_in_rel` in geoparse.py),
-    # check to see if that's a country or admin1. 
+
     if 'in_rel' in ex.keys():
         if ex['in_rel']:
             parent_place = geonames_service.get_country_by_name(ex['in_rel'])
             if not parent_place:
                 parent_place = geonames_service.get_adm1_country_entry(ex['in_rel'], None)
         else:
-            parent_place = None 
+            parent_place = None
     else:
-        parent_place = None 
-    
+        parent_place = None
+
     search_res = geonames_service.search_by_name(search_name, max_results, fuzzy, limit_types, known_country)
     choices = res_formatter(search_res, search_name, parent_place)
 
-    # Always try a fuzzy search if no results from previous search, to avoid 
-    # having no candidates for the ML model to choose from.
+    # Always try a fuzzy search if no results, to avoid empty candidate set.
     if not choices:
         search_res = geonames_service.search_by_name(search_name, max_results, fuzzy+1, limit_types, known_country)
         choices = res_formatter(search_res, ex['search_name'], parent_place)
@@ -491,27 +409,27 @@ def add_es_data(ex,
     if remove_correct:
         choices = [c for c in choices if c['geonameid'] != ex['correct_geonamesid']]
 
-    # Always add a final "NULL" choice at the end
+    # Always add a final NULL choice at the end
     logger.debug("Adding NULL choice")
-    null_choice = {'feature_code': 'NULL', 
-            'feature_class': 'NULL', 
-            'country_code3': 'NULL', 
-            'lat': 0, 
-            'lon': 0, 
-            'name': 'NULL', 
-            'admin1_code': 'NULL', 
-            'admin1_name': 'NULL', 
-            'admin2_code': 'NULL', 
-            'admin2_name': 'NULL', 
-            'geonameid': 'NULL', 
-            'admin1_parent_match': -1, 
-            'country_code_parent_match': -1, 
-            'alt_name_length': 0, 
-            'min_dist': 99.0, 
-            'max_dist': 99.0, 
-            'avg_dist': 99.0, 
-            'ascii_dist': 99.0, 
-            'adm1_count': 0.0, 
+    null_choice = {'feature_code': 'NULL',
+            'feature_class': 'NULL',
+            'country_code3': 'NULL',
+            'lat': 0,
+            'lon': 0,
+            'name': 'NULL',
+            'admin1_code': 'NULL',
+            'admin1_name': 'NULL',
+            'admin2_code': 'NULL',
+            'admin2_name': 'NULL',
+            'geonameid': 'NULL',
+            'admin1_parent_match': -1,
+            'country_code_parent_match': -1,
+            'alt_name_length': 0,
+            'min_dist': 99.0,
+            'max_dist': 99.0,
+            'avg_dist': 99.0,
+            'ascii_dist': 99.0,
+            'adm1_count': 0.0,
             'country_count': 0.0}
     choices.append(null_choice)
     ex['es_choices'] = choices
@@ -522,7 +440,6 @@ def add_es_data(ex,
         if 'correct_geonamesid' in ex.keys():
             ex['correct'] = [c['geonameid'] == ex['correct_geonamesid'] for c in choices]
     return ex
-
 
 
 def add_es_data_doc(doc_ex, conn, max_results=50, fuzzy=0, limit_types=False,
@@ -549,48 +466,48 @@ def add_es_data_doc(doc_ex, conn, max_results=50, fuzzy=0, limit_types=False,
 
 def res_formatter(res, search_name, parent=None):
     """
-    Helper function to format the ES/Geonames results into a format for the ML model, including
-    edit distance statistics and parent matches.
+    Format Geonames/Postgres results into a form for the ML model, including
+    edit distance statistics and parent match features.
 
     Parameters
     ----------
-    res: Elasticsearch/Geonames output
-    search_name: str
-      The original search term from the document
-    parent: dict
-      Geonames/ES entry for the inferred parent 
+    res : dict
+        Search result in the envelope shape:
+        {'hits': {'hits': [{'_source': {...}}, ...]}}
+    search_name : str
+        The original search term from the document.
+    parent : dict or None
+        Geonames entry for the inferred parent location (from in_rel).
 
     Returns
     -------
-    choices: list
-      List of formatted Geonames results, including edit distance statistics
+    choices : list of dicts
     """
-    # choices is our eventual output, a list of dicts, each of which is a formatted Geonames result 
     choices = []
     alt_lengths = []
     min_dist = []
     max_dist = []
     avg_dist = []
     ascii_dist = []
-    # iterate through the docs returned by ES
-    for i in res['hits']['hits']:
-        i = i.to_dict()['_source']
-        names = [i['name']] + i['alternativenames'] 
+
+    for hit in res['hits']['hits']:
+        # Our Postgres envelope uses plain dicts; no .to_dict() call needed.
+        i = hit['_source']
+        names = [i['name']] + i['alternativenames']
         dists = [jellyfish.levenshtein_distance(search_name, j) for j in names]
-        lat, lon = i['coordinates'].split(",")
         d = {"feature_code": i['feature_code'],
             "feature_class": i['feature_class'],
             "country_code3": i['country_code3'],
-            "lat": float(lat),
-            "lon": float(lon),
+            "lat": float(i['lat']),
+            "lon": float(i['lon']),
             "name": i['name'],
             "admin1_code": i['admin1_code'],
             "admin1_name": i['admin1_name'],
             "admin2_code": i['admin2_code'],
             "admin2_name": i['admin2_name'],
             "geonameid": i['geonameid']}
-        # if we detect a parent country or ADM1, add the parent match features
-        if parent: 
+
+        if parent:
             if parent['admin1_name'] == "":
                 d['admin1_parent_match'] = 0
             elif parent['admin1_name'] == i['admin1_name']:
@@ -609,11 +526,12 @@ def res_formatter(res, search_name, parent=None):
             d['country_code_parent_match'] = 0
 
         choices.append(d)
-        alt_lengths.append(len(i['alternativenames'])+1)
+        alt_lengths.append(len(i['alternativenames']) + 1)
         min_dist.append(np.min(dists))
         max_dist.append(np.max(dists))
         avg_dist.append(np.mean(dists))
         ascii_dist.append(jellyfish.levenshtein_distance(search_name, i['asciiname']))
+
     alt_lengths = np.log(alt_lengths)
     min_dist = normalize(min_dist)
     max_dist = normalize(max_dist)
@@ -631,53 +549,37 @@ def res_formatter(res, search_name, parent=None):
 
 def make_admin1_counts(out):
     """
-    Get the ADM1s from all candidate results for all locations in a document and return
-    the count of each ADM1. This allows us to prefer candidates that share an ADM1 with other
-    locations in a document.
-    
-    This is getting at roughly the same info as previous (slow) approaches that tried to minimize
-    the distance between the returned geolocations.
-
-    Parameters
-    ---------
-    out: list of dicts
-      List of place names from the document with candidate geolocations
-      from ES/Geonames
-
-    Returns
-    -------
-    admin1_count: dict
-      A dictionary {adm1: count}, where count is the proportion of place names in the
-      document that have at least one candidate entry from this adm1.
+    Get the ADM1s from all candidate results for all locations in a document
+    and return the proportion of place names that have at least one candidate
+    from each ADM1. Used as a document-level coherence feature.
     """
     admin1s = []
-
-    # for each entity, get the unique ADM1s from the search results 
     for es in out:
         other_adm1 = set([i['admin1_name'] for i in es['es_choices']])
         admin1s.extend(list(other_adm1))
-    
-    # TODO: handle the "" admins here.
     admin1_count = dict(Counter(admin1s))
     for k, v in admin1_count.items():
         admin1_count[k] = v / len(out)
     return admin1_count
 
+
 def make_country_counts(out):
-    """Take in a document's worth of examples and return the count of countries"""
+    """
+    Get the countries from all candidate results for all locations in a
+    document and return the proportion of place names with candidates from
+    each country. Used as a document-level coherence feature.
+    """
     all_countries = []
     for es in out:
         countries = set([i['country_code3'] for i in es['es_choices']])
         all_countries.extend(list(countries))
-    
     country_count = dict(Counter(all_countries))
     for k, v in country_count.items():
         country_count[k] = v / len(out)
-        
     return country_count
 
 
-def normalize(ll: list[float]) -> npt.NDArray[np.float64]:    
+def normalize(ll: list[float]) -> npt.NDArray[np.float64]:
     """Normalize an array to [0, 1]"""
     arr = np.array(ll)
     if len(arr) > 0:
@@ -686,4 +588,3 @@ def normalize(ll: list[float]) -> npt.NDArray[np.float64]:
             max_arr = 0.001
         arr = (arr - np.min(arr)) / max_arr
     return arr
-
