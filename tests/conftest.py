@@ -4,7 +4,7 @@ import pytest
 from mordecai3.geonames import DataExtent, GeonamesService, setup_pg_pool
 from mordecai3.logging import setup_logging
 
-PG_DSN = os.getenv("PG_DSN", "host=localhost dbname=geoindex user=postgres")
+PG_DSN = os.getenv("PG_DSN", "host=localhost dbname=fp2 user=postgres")
 
 setup_logging()
 

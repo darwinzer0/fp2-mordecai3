@@ -12,23 +12,27 @@ Key differences from the ES version:
   geonames_place_stats (a separate normalised table populated in step 02).
 - Fuzzy search uses pg_trgm similarity rather than ES fuzziness parameter.
 - The DataExtent check queries Postgres instead of ES.
-- Connection is a psycopg2 connection pool rather than an ES client.
+- Connection pool uses psycopg (v3) ConnectionPool.
+
+One mordecai dependency removed: elasticsearch + elasticsearch_dsl.
+New dependency added: psycopg[pool] (psycopg v3).
+All other mordecai dependencies (spacy, torch, jellyfish, numpy) unchanged.
 """
 
 import logging
 import re
 from enum import IntEnum
 
-import psycopg2
-import psycopg2.extras
-from psycopg2 import pool
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 
 # ---------------------------------------------------------------------------
-# DataExtent
+# DataExtent (unchanged from original)
 # ---------------------------------------------------------------------------
 
 class DataExtent(IntEnum):
@@ -42,23 +46,23 @@ class DataExtent(IntEnum):
 # Connection pool helper
 # ---------------------------------------------------------------------------
 
-def setup_pg_pool(dsn: str, minconn: int = 1, maxconn: int = 10):
+def setup_pg_pool(dsn: str, min_size: int = 1, max_size: int = 10) -> ConnectionPool:
     """
-    Create a psycopg2 ThreadedConnectionPool.
+    Create a psycopg v3 ConnectionPool.
 
     Parameters
     ----------
     dsn : str
         libpq connection string, e.g.
         "host=localhost dbname=geoindex user=postgres password=secret"
-    minconn, maxconn : int
-        Pool size limits. For multiprocessing workloads set maxconn >= workers.
+    min_size, max_size : int
+        Pool size limits. For multiprocessing workloads set max_size >= workers.
 
     Returns
     -------
-    psycopg2.pool.ThreadedConnectionPool
+    psycopg_pool.ConnectionPool
     """
-    return pool.ThreadedConnectionPool(minconn, maxconn, dsn)
+    return ConnectionPool(dsn, min_size=min_size, max_size=max_size)
 
 
 # ---------------------------------------------------------------------------
@@ -82,14 +86,14 @@ except ImportError:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _fetch(conn, sql: str, params) -> list:
-    """Execute a query and return all rows as RealDictRow list."""
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+def _fetch(conn: psycopg.Connection, sql: str, params) -> list[dict]:
+    """Execute a query and return all rows as plain dicts."""
+    with conn.cursor(row_factory=dict_row) as cur:
         cur.execute(sql, params)
         return cur.fetchall()
 
 
-def _format_rows(rows: list) -> list:
+def _format_rows(rows: list[dict]) -> list[dict]:
     """
     Convert raw DB rows into the dict shape that res_formatter() in
     geoparse.py and _format_country_results() below expect.
@@ -109,29 +113,28 @@ def _format_rows(rows: list) -> list:
         seen.add(gid)
         lat, lon = _h3_to_latlon(r['h3_index'])
         out.append({
-            'geonameid':         str(gid),
-            'name':              r['name'],
-            # asciiname: best approximation available without storing it
-            # separately; good enough for the ascii_dist Levenshtein feature.
-            'asciiname':         r['name'],
-            'alternativenames':  list(r['alternativenames'] or []),
-            'feature_class':     r['feature_class'] or '',
-            'feature_code':      r['feature_code'] or '',
-            'country_code3':     r['country_code3'] or '',
-            'admin1_name':       r['admin1_name'] or '',
-            'admin2_name':       '',   # not used by the ranker
-            'admin1_code':       '',   # not used by the ranker
-            'admin2_code':       '',   # not used by the ranker
-            'alt_name_length':   int(r['alternate_name_count'] or 0),
-            'lat':               lat,
-            'lon':               lon,
-            # coordinates string format expected by _format_country_results
-            'coordinates':       f"{lat},{lon}",
+            'geonameid':        str(gid),
+            'name':             r['name'],
+            # asciiname: best approximation without storing it separately;
+            # good enough for the ascii_dist Levenshtein feature.
+            'asciiname':        r['name'],
+            'alternativenames': list(r['alternativenames'] or []),
+            'feature_class':    r['feature_class'] or '',
+            'feature_code':     r['feature_code'] or '',
+            'country_code3':    r['country_code3'] or '',
+            'admin1_name':      r['admin1_name'] or '',
+            'admin2_name':      '',   # not used by the ranker
+            'admin1_code':      '',   # not used by the ranker
+            'admin2_code':      '',   # not used by the ranker
+            'alt_name_length':  int(r['alternate_name_count'] or 0),
+            'lat':              lat,
+            'lon':              lon,
+            'coordinates':      f"{lat},{lon}",
         })
     return out
 
 
-def _format_country_results(formatted_rows: list) -> dict | None:
+def _format_country_results(formatted_rows: list[dict]) -> dict | None:
     """
     Return a single result dict in the shape that geoparse.py expects from
     the single-entry lookup methods. Mirrors the original exactly.
@@ -158,20 +161,20 @@ def _format_country_results(formatted_rows: list) -> dict | None:
 def _clean_search_name(search_name: str) -> str:
     """
     Strip administrative suffixes that prevent correct candidate matching.
-    Identical logic to the original; converted to use word-boundary regex
-    to avoid partial-word stripping (e.g. "City" in "Mexico City" → "Mexico").
+    Identical logic to the original; uses word-boundary regex to avoid
+    partial-word stripping (e.g. "City" in "Mexico City").
     """
-    search_name = re.sub(r"(?i)^the\s+",       "", search_name).strip()
+    search_name = re.sub(r"(?i)^the\s+",            "", search_name).strip()
     search_name = re.sub(r"(?i)\btribal district\b", "", search_name).strip()
-    search_name = re.sub(r"(?i)\bcity\b",       "", search_name).strip()
-    search_name = re.sub(r"(?i)\bdistrict\b",   "", search_name).strip()
-    search_name = re.sub(r"(?i)\bmetropolis\b", "", search_name).strip()
-    search_name = re.sub(r"(?i)\bcounty\b",     "", search_name).strip()
-    search_name = re.sub(r"(?i)\bregion\b",     "", search_name).strip()
-    search_name = re.sub(r"(?i)\bprovince\b",   "", search_name).strip()
-    search_name = re.sub(r"(?i)\bterritory\b",  "", search_name).strip()
-    search_name = re.sub(r"(?i)\bbranch\b",     "", search_name).strip()
-    search_name = re.sub(r"'s$",                "", search_name).strip()
+    search_name = re.sub(r"(?i)\bcity\b",            "", search_name).strip()
+    search_name = re.sub(r"(?i)\bdistrict\b",        "", search_name).strip()
+    search_name = re.sub(r"(?i)\bmetropolis\b",      "", search_name).strip()
+    search_name = re.sub(r"(?i)\bcounty\b",          "", search_name).strip()
+    search_name = re.sub(r"(?i)\bregion\b",          "", search_name).strip()
+    search_name = re.sub(r"(?i)\bprovince\b",        "", search_name).strip()
+    search_name = re.sub(r"(?i)\bterritory\b",       "", search_name).strip()
+    search_name = re.sub(r"(?i)\bbranch\b",          "", search_name).strip()
+    search_name = re.sub(r"'s$",                     "", search_name).strip()
     if search_name.upper() == "US":
         search_name = "United States"
     return search_name
@@ -180,6 +183,23 @@ def _clean_search_name(search_name: str) -> str:
 # ---------------------------------------------------------------------------
 # GeonamesService
 # ---------------------------------------------------------------------------
+
+# SQL for single-entry lookups (no alternativenames self-join needed).
+_SINGLE_ENTRY_SELECT = """
+    SELECT DISTINCT ON (g.geonames_id)
+        g.geonames_id,
+        g.place_name                                     AS name,
+        g.feature_class,
+        g.feature_code,
+        g.h3_index,
+        COALESCE(ps.country_code3, '')                   AS country_code3,
+        COALESCE(ps.admin1_name,   '')                   AS admin1_name,
+        COALESCE(ps.alternate_name_count, 0)             AS alternate_name_count,
+        ARRAY[]::TEXT[]                                  AS alternativenames
+    FROM gazetteer g
+    LEFT JOIN geonames_place_stats ps ON ps.geonames_id = g.geonames_id
+"""
+
 
 class GeonamesService:
     """
@@ -190,18 +210,12 @@ class GeonamesService:
 
     Parameters
     ----------
-    pg_pool : psycopg2.pool.ThreadedConnectionPool
+    pg_pool : psycopg_pool.ConnectionPool
         Created by setup_pg_pool(dsn).
     """
 
-    def __init__(self, pg_pool):
+    def __init__(self, pg_pool: ConnectionPool):
         self._pool = pg_pool
-
-    def _conn(self):
-        return self._pool.getconn()
-
-    def _release(self, conn):
-        self._pool.putconn(conn)
 
     # ------------------------------------------------------------------
     # DataExtent check
@@ -228,54 +242,25 @@ class GeonamesService:
 
     # ------------------------------------------------------------------
     # Single-entry lookups
-    # Used by geoparse.py for in_rel parent resolution and hierarchy lookup.
-    # These don't need the alternativenames array so we skip the self-join.
     # ------------------------------------------------------------------
 
     def get_entry_by_id(self, geonameid: str) -> dict | None:
         """Return a single gazetteer entry by geonames_id."""
-        sql = """
-            SELECT DISTINCT ON (g.geonames_id)
-                g.geonames_id,
-                g.place_name                                     AS name,
-                g.feature_class,
-                g.feature_code,
-                g.h3_index,
-                COALESCE(ps.country_code3, '')                   AS country_code3,
-                COALESCE(ps.admin1_name,   '')                   AS admin1_name,
-                COALESCE(ps.alternate_name_count, 0)             AS alternate_name_count,
-                ARRAY[]::TEXT[]                                  AS alternativenames
-            FROM gazetteer g
-            LEFT JOIN geonames_place_stats ps ON ps.geonames_id = g.geonames_id
+        sql = _SINGLE_ENTRY_SELECT + """
             WHERE g.geonames_id = %s
             ORDER BY g.geonames_id, g.importance DESC NULLS LAST
             LIMIT 1
         """
-        conn = self._conn()
-        try:
+        with self._pool.connection() as conn:
             rows = _fetch(conn, sql, (int(geonameid),))
-        finally:
-            self._release(conn)
         return _format_country_results(_format_rows(rows))
 
     def get_adm1_country_entry(self,
                                adm1: str,
                                iso3c: str | None = None) -> dict | None:
-        """Return the ADM1 entry for a state/province name, optionally filtered by ISO3."""
+        """Return the ADM1 entry for a state/province, optionally filtered by ISO3."""
         if iso3c:
-            sql = """
-                SELECT DISTINCT ON (g.geonames_id)
-                    g.geonames_id,
-                    g.place_name    AS name,
-                    g.feature_class,
-                    g.feature_code,
-                    g.h3_index,
-                    COALESCE(ps.country_code3, '')       AS country_code3,
-                    COALESCE(ps.admin1_name,   '')       AS admin1_name,
-                    COALESCE(ps.alternate_name_count, 0) AS alternate_name_count,
-                    ARRAY[]::TEXT[]                      AS alternativenames
-                FROM gazetteer g
-                LEFT JOIN geonames_place_stats ps ON ps.geonames_id = g.geonames_id
+            sql = _SINGLE_ENTRY_SELECT + """
                 WHERE g.feature_code = 'ADM1'
                   AND ps.country_code3 = %s
                   AND lower(g.place_name) = lower(%s)
@@ -284,19 +269,7 @@ class GeonamesService:
             """
             params = (iso3c, adm1)
         else:
-            sql = """
-                SELECT DISTINCT ON (g.geonames_id)
-                    g.geonames_id,
-                    g.place_name    AS name,
-                    g.feature_class,
-                    g.feature_code,
-                    g.h3_index,
-                    COALESCE(ps.country_code3, '')       AS country_code3,
-                    COALESCE(ps.admin1_name,   '')       AS admin1_name,
-                    COALESCE(ps.alternate_name_count, 0) AS alternate_name_count,
-                    ARRAY[]::TEXT[]                      AS alternativenames
-                FROM gazetteer g
-                LEFT JOIN geonames_place_stats ps ON ps.geonames_id = g.geonames_id
+            sql = _SINGLE_ENTRY_SELECT + """
                 WHERE g.feature_code = 'ADM1'
                   AND lower(g.place_name) = lower(%s)
                 ORDER BY g.geonames_id, g.importance DESC NULLS LAST
@@ -304,65 +277,32 @@ class GeonamesService:
             """
             params = (adm1,)
 
-        conn = self._conn()
-        try:
+        with self._pool.connection() as conn:
             rows = _fetch(conn, sql, params)
-        finally:
-            self._release(conn)
         return _format_country_results(_format_rows(rows))
 
     def get_country_entry(self, iso3c: str) -> dict | None:
         """Return the PCLI entry for a country given its ISO3 code."""
-        sql = """
-            SELECT DISTINCT ON (g.geonames_id)
-                g.geonames_id,
-                g.place_name    AS name,
-                g.feature_class,
-                g.feature_code,
-                g.h3_index,
-                COALESCE(ps.country_code3, '')       AS country_code3,
-                COALESCE(ps.admin1_name,   '')       AS admin1_name,
-                COALESCE(ps.alternate_name_count, 0) AS alternate_name_count,
-                ARRAY[]::TEXT[]                      AS alternativenames
-            FROM gazetteer g
-            LEFT JOIN geonames_place_stats ps ON ps.geonames_id = g.geonames_id
+        sql = _SINGLE_ENTRY_SELECT + """
             WHERE g.feature_code = 'PCLI'
               AND ps.country_code3 = %s
             ORDER BY g.geonames_id, g.importance DESC NULLS LAST
             LIMIT 1
         """
-        conn = self._conn()
-        try:
+        with self._pool.connection() as conn:
             rows = _fetch(conn, sql, (iso3c,))
-        finally:
-            self._release(conn)
         return _format_country_results(_format_rows(rows))
 
     def get_country_by_name(self, country_name: str) -> dict | None:
         """Return the PCLI entry for a country matched by name."""
-        sql = """
-            SELECT DISTINCT ON (g.geonames_id)
-                g.geonames_id,
-                g.place_name    AS name,
-                g.feature_class,
-                g.feature_code,
-                g.h3_index,
-                COALESCE(ps.country_code3, '')       AS country_code3,
-                COALESCE(ps.admin1_name,   '')       AS admin1_name,
-                COALESCE(ps.alternate_name_count, 0) AS alternate_name_count,
-                ARRAY[]::TEXT[]                      AS alternativenames
-            FROM gazetteer g
-            LEFT JOIN geonames_place_stats ps ON ps.geonames_id = g.geonames_id
+        sql = _SINGLE_ENTRY_SELECT + """
             WHERE g.feature_code = 'PCLI'
               AND lower(g.place_name) = lower(%s)
             ORDER BY g.geonames_id, g.importance DESC NULLS LAST
             LIMIT 1
         """
-        conn = self._conn()
-        try:
+        with self._pool.connection() as conn:
             rows = _fetch(conn, sql, (country_name,))
-        finally:
-            self._release(conn)
         return _format_country_results(_format_rows(rows))
 
     # ------------------------------------------------------------------
@@ -398,45 +338,45 @@ class GeonamesService:
         """
         search_name = _clean_search_name(search_name)
 
-        conn = self._conn()
-        try:
+        with self._pool.connection() as conn:
             rows = self._search(conn, search_name, int(max_results),
                                 fuzzy, limit_types, known_country)
-        finally:
-            self._release(conn)
 
         formatted = _format_rows(rows)
-        # Wrap in ES envelope — res_formatter iterates res['hits']['hits']
         return {'hits': {'hits': [{'_source': r} for r in formatted]}}
 
-    def _search(self, conn, search_name: str, max_results: int,
-                fuzzy: int, limit_types: bool,
-                known_country: str | None) -> list:
+    def _search(self,
+                conn: psycopg.Connection,
+                search_name: str,
+                max_results: int,
+                fuzzy: int,
+                limit_types: bool,
+                known_country: str | None) -> list[dict]:
         """
         Core candidate query.
 
-        Strategy:
-        - Inner subquery finds the best (highest importance) gazetteer row
-          per geonames_id that matches the search name.
-        - Outer query joins geonames_place_stats for ranker features and
+        - Inner subquery: one row per geonames_id, highest-importance match.
+        - Outer query: joins geonames_place_stats for ranker features and
           self-joins gazetteer to aggregate all name variants as
           alternativenames[], mirroring the ES stored field.
-        - Results ordered by alternate_name_count DESC (prominence) to
-          match the ES sort on alt_name_length.
+        - Ordered by alternate_name_count DESC (prominence) matching the
+          original ES sort on alt_name_length.
 
-        pg_trgm index (GIN on place_name) must exist for fuzzy queries to
-        be fast. Exact queries use the btree index on place_name.
+        Requires:
+          CREATE INDEX ON gazetteer (lower(place_name));
+          CREATE EXTENSION pg_trgm;
+          CREATE INDEX ON gazetteer USING GIN (place_name gin_trgm_ops);
         """
-        # Build optional filter clauses
         type_filter    = "AND inner_g.feature_class IN ('P', 'A')" if limit_types else ""
         country_filter = "AND ps.country_code3 = %(known_country)s" if known_country else ""
 
         if fuzzy == 0:
             match_filter = "AND lower(inner_g.place_name) = lower(%(search_name)s)"
         else:
-            # pg_trgm similarity threshold: 0.35 for fuzzy=1, 0.2 for fuzzy=2+
             threshold = max(0.2, 0.5 - fuzzy * 0.15)
-            match_filter = f"AND similarity(inner_g.place_name, %(search_name)s) > {threshold}"
+            match_filter = (
+                f"AND similarity(inner_g.place_name, %(search_name)s) > {threshold}"
+            )
 
         sql = f"""
             SELECT
@@ -455,8 +395,6 @@ class GeonamesService:
                     ARRAY[]::TEXT[]
                 )                                                    AS alternativenames
             FROM (
-                -- One row per geonames_id: highest-importance name variant
-                -- that matched the search term.
                 SELECT DISTINCT ON (inner_g.geonames_id)
                     inner_g.geonames_id,
                     inner_g.place_name,
@@ -471,8 +409,6 @@ class GeonamesService:
             ) g
             LEFT JOIN geonames_place_stats ps
                    ON ps.geonames_id = g.geonames_id
-            -- Collect all name variants for this geonames_id so
-            -- res_formatter can compute Levenshtein across all of them.
             LEFT JOIN gazetteer other
                    ON other.geonames_id = g.geonames_id
             WHERE TRUE
