@@ -74,7 +74,7 @@ def setup_pg_pool(dsn: str, min_size: int = 1, max_size: int = 10) -> Connection
 try:
     import h3 as h3lib
     def _h3_to_latlon(h3_index: str):
-        lat, lon = h3lib.h3_to_geo(h3_index)
+        lat, lon = h3lib.cell_to_latlng(h3_index)
         return float(lat), float(lon)
 except ImportError:
     logger.warning("h3 library not available; lat/lon will be 0.0")
